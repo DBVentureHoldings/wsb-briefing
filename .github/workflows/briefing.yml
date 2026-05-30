@@ -1,0 +1,38 @@
+name: WSB Morning Briefing
+
+on:
+  schedule:
+    # 14:00 UTC = 7am PDT (Mar–Nov) / 6am PST (Nov–Mar). Mon–Fri.
+    # GitHub Actions cron is UTC-only, so the briefing arrives 1 hour earlier
+    # during PST. You're asleep either way.
+    - cron: '0 14 * * 1-5'
+  # Lets you trigger a run manually from the Actions tab whenever you want.
+  workflow_dispatch:
+
+jobs:
+  brief:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Refresh ticker universe (best-effort)
+        continue-on-error: true
+        run: python update_tickers.py
+
+      - name: Run briefing
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          RECIPIENTS: ${{ secrets.RECIPIENTS }}
+        run: python scraper.py
