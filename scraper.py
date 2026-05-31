@@ -1,9 +1,9 @@
 """WSB morning briefing — orchestrator.
 
 Usage:
-  python scraper.py              # full run: fetch, summarize, email, save report
-  python scraper.py --dry-run    # fetch + extract only, print to stdout, no API calls, no email
-  python scraper.py --no-email   # skip email but do everything else (saves report)
+  python scraper.py              # full run: fetch, summarize, email, save
+  python scraper.py --dry-run    # fetch only, print to stdout, no Claude/email
+  python scraper.py --no-email   # everything except the email send
 """
 
 from __future__ import annotations
@@ -17,66 +17,56 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 HERE = Path(__file__).parent
-# override=True so an empty shell var (e.g. from ~/.zshrc) doesn't shadow .env.
+# override=True so an empty shell var doesn't shadow .env values.
 load_dotenv(HERE / ".env", override=True)
 
+from apewisdom_client import fetch_top_tickers  # noqa: E402
 from reddit_client import fetch_recent_posts  # noqa: E402
-from ticker_extractor import tally  # noqa: E402
-from render import ReportData, render_markdown, render_html  # noqa: E402
-
-
-def _ensure_tickers_file() -> None:
-    if not (HERE / "tickers.txt").exists():
-        print("tickers.txt missing — fetching ticker universe...", file=sys.stderr)
-        import update_tickers
-        if update_tickers.main() != 0:
-            raise SystemExit("failed to fetch ticker universe")
+from render import ReportData, render_html, render_markdown  # noqa: E402
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true", help="no Claude, no email")
     ap.add_argument("--no-email", action="store_true", help="skip email send")
-    ap.add_argument("--limit", type=int, default=100, help="max posts to pull")
-    ap.add_argument("--top-n", type=int, default=20, help="tickers to show in report")
+    ap.add_argument("--top-n", type=int, default=20, help="tickers to show")
+    ap.add_argument("--posts", type=int, default=25, help="RSS posts to pull")
     args = ap.parse_args()
 
-    _ensure_tickers_file()
+    print("Fetching apewisdom ticker rankings...", file=sys.stderr)
+    tickers = fetch_top_tickers(limit=args.top_n)
+    print(f"  {len(tickers)} tickers; top: " + ", ".join(
+        f"{t.symbol}({t.mentions})" for t in tickers[:10]
+    ), file=sys.stderr)
 
-    print("Fetching r/wallstreetbets...", file=sys.stderr)
-    posts = fetch_recent_posts(limit=args.limit)
-    comments_total = sum(len(p.comments) for p in posts)
-    print(f"  {len(posts)} posts, {comments_total} comments", file=sys.stderr)
-
-    print("Extracting tickers...", file=sys.stderr)
-    ranked = tally(posts)
-    print(
-        f"  {len(ranked)} distinct tickers; top: "
-        + ", ".join(f"{t.symbol}({t.mention_count})" for t in ranked[:10]),
-        file=sys.stderr,
-    )
+    print("Fetching Reddit RSS posts...", file=sys.stderr)
+    posts = fetch_recent_posts(limit=args.posts)
+    print(f"  {len(posts)} posts", file=sys.stderr)
 
     if args.dry_run:
         print("\n--- DRY RUN ticker table ---")
-        for i, t in enumerate(ranked[: args.top_n], start=1):
+        for t in tickers[: args.top_n]:
+            rc = t.rank_change
+            rc_str = (
+                f"new" if rc is None
+                else (f"↑{rc}" if rc > 0 else (f"↓{-rc}" if rc < 0 else "—"))
+            )
             print(
-                f"{i:>2}. {t.symbol:<6} mentions={t.mention_count:<3} "
-                f"weighted={t.weighted_score:<6} sentiment={t.sentiment}"
+                f"#{t.rank:>2} {rc_str:>4}  {t.symbol:<6} {t.name[:32]:<32} "
+                f"mentions={t.mentions:<4} upvotes={t.upvotes}"
             )
         return 0
 
     print("Summarizing with Claude...", file=sys.stderr)
-    from summarizer import summarize  # lazy import so dry-run doesn't need anthropic
-    briefing = summarize(posts, ranked)
+    from summarizer import summarize  # lazy import
+    briefing = summarize(posts, tickers)
 
-    top_posts = sorted(posts, key=lambda p: p.score, reverse=True)
     report = ReportData(
         on_date=date.today(),
         posts_scanned=len(posts),
-        comments_scanned=comments_total,
-        tickers=ranked,
+        tickers=tickers,
         briefing=briefing,
-        top_posts=top_posts,
+        top_posts=posts,
     )
 
     md = render_markdown(report, top_n=args.top_n)
@@ -92,7 +82,7 @@ def main() -> int:
         return 0
 
     from emailer import send  # lazy import
-    top_ticker = ranked[0].symbol if ranked else "—"
+    top_ticker = tickers[0].symbol if tickers else "—"
     subject = f"WSB Briefing {report.on_date.isoformat()} — top: {top_ticker}"
     try:
         send(subject, html, md)

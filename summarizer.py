@@ -1,4 +1,10 @@
-"""Send the day's WSB corpus to Claude Haiku and get a structured briefing back."""
+"""Claude summarization layer.
+
+Takes pre-ranked tickers from apewisdom and post text from Reddit's RSS,
+asks Claude Haiku for: overall market mood, dominant themes, per-ticker
+take + industry, and a 2-3 sentence summary of each top post. Strict-JSON
+output validated on the way in.
+"""
 
 from __future__ import annotations
 
@@ -9,17 +15,17 @@ from dataclasses import dataclass
 
 import anthropic
 
+from apewisdom_client import TickerData
 from reddit_client import Post
-from ticker_extractor import TickerTally
+
 
 MODEL = "claude-haiku-4-5-20251001"
 
-POST_BODY_TRIM = 800
-COMMENT_TRIM = 300
-TOP_N_TICKERS = 20  # tickers for which Claude returns name + industry
-TOP_N_TICKER_NOTES = 10  # tickers that also get a rich WSB-take note
+POST_BODY_TRIM = 1200
+TOP_N_TICKERS = 20
+TOP_N_TICKER_NOTES = 10
 TOP_N_POSTS_TO_SUMMARIZE = 10
-MAX_POSTS_IN_CONTEXT = 40
+MAX_POSTS_IN_CONTEXT = 25
 
 SYSTEM_PROMPT = """You are a markets analyst summarizing overnight chatter from r/wallstreetbets for a serious retail trader and his finance-industry friend. They want a quick, no-fluff read on what retail is talking about — not investment advice.
 
@@ -31,21 +37,21 @@ Output strict JSON with this shape (no prose outside the JSON):
     "<3 to 5 bullets, each one sentence, describing dominant narratives — e.g. earnings reactions, sector rotation, specific catalysts>"
   ],
   "ticker_notes": [
-    {"symbol": "NVDA", "name": "NVIDIA Corporation", "industry": "Semiconductors", "note": "<one short sentence on what WSB is saying about it and why; empty string if outside the top 10 by mention count>"}
+    {"symbol": "NVDA", "industry": "Semiconductors", "sentiment": "bullish|bearish|mixed|neutral", "note": "<one short sentence on what WSB is saying about it and why; empty string if outside the top 10 by mention count>"}
   ],
   "post_summaries": [
-    {"id": "<the POST_ID I tagged each post with>", "summary": "<2-3 sentences capturing what the post actually argues/shows, including any numbers, tickers, or stakes mentioned in the body or top comments. If it's pure shitpost or meme, say so concisely.>"}
+    {"id": "<the POST_ID I tagged each post with>", "summary": "<2-3 sentences capturing what the post actually argues/shows, including any numbers, tickers, or stakes mentioned. If it's pure shitpost or meme, say so concisely.>"}
   ]
 }
 
 Rules:
-- ticker_notes covers EVERY ticker I provide, in the same order. Always include `name` (the company's full legal name) and `industry` (specific GICS sub-industry: e.g. "Semiconductors", "Oil & Gas Exploration & Production", "Biotechnology", "Regional Banks"). For tickers ranked outside the top 10 by mention count, set `note` to an empty string.
-- For the top 10 tickers, `note` is one sentence on what WSB is saying and why.
+- ticker_notes covers EVERY ticker I provide, in the same order. Always include `industry` (specific GICS sub-industry: e.g. "Semiconductors", "Oil & Gas Exploration & Production", "Biotechnology", "Regional Banks") and `sentiment`. For tickers ranked outside the top 10, set `note` to an empty string.
+- For the top 10 tickers, `note` is one sentence on what WSB is saying and why. Use the rank-change context I give you (e.g. a ticker jumping from rank 28 to rank 1 is the day's story).
 - post_summaries covers EVERY post I provide that has a POST_ID tag, in the same order.
 - Be concrete. Reference the catalyst (earnings, news, options flow, FOMC, etc.) when it's in the source text.
-- If the chatter is shitposting with no thesis, say so plainly. Don't manufacture signal.
+- If chatter is shitposting with no thesis, say so plainly. Don't manufacture signal.
 - No disclaimers, no "not financial advice" boilerplate. The reader knows.
-- If you genuinely don't recognize a ticker, set name to "Unknown" and industry to "Unknown" — never guess.
+- If you genuinely don't recognize a ticker, set industry to "Unknown" — never guess.
 """
 
 
@@ -53,61 +59,32 @@ Rules:
 class Briefing:
     market_mood: str
     themes: list[str]
-    ticker_notes: list[dict]  # [{symbol, note}, ...]
-    post_summaries: dict[str, str]  # post_id -> 2-3 sentence summary
+    ticker_notes: list[dict]  # [{symbol, industry, sentiment, note}, ...]
+    post_summaries: dict[str, str]  # post_id -> summary
 
 
-def _build_corpus(
-    posts: list[Post],
-    top_tickers: list[TickerTally],
-    must_include_ids: set[str],
-) -> str:
-    """Build the prompt corpus.
+def _format_ticker_for_prompt(t: TickerData) -> str:
+    rc = t.rank_change
+    rc_str = (
+        f"unchanged" if rc == 0 or rc is None
+        else (f"climbed {rc} (was #{t.rank_24h_ago})" if rc > 0
+              else f"fell {-rc} (was #{t.rank_24h_ago})")
+    )
+    return f"#{t.rank} {t.symbol} ({t.name}) — {t.mentions} mentions, {t.upvotes} upvotes, rank {rc_str}"
 
-    Posts that must be summarized (top-by-score) are always included AND
-    tagged with POST_ID so Claude can reference them in the response.
-    Other posts are picked by ticker-relevance and shown without IDs.
-    """
-    top_symbols = {t.symbol for t in top_tickers[:TOP_N_TICKERS]}
 
-    def relevance(p: Post) -> int:
-        text_upper = p.combined_text.upper()
-        return sum(1 for s in top_symbols if s in text_upper) * 1000 + p.score
-
-    ranked = sorted(posts, key=relevance, reverse=True)
-    selected: list[Post] = []
-    seen_ids: set[str] = set()
-    for p in ranked:
-        if p.id in seen_ids:
-            continue
-        if len(selected) < MAX_POSTS_IN_CONTEXT or p.id in must_include_ids:
-            selected.append(p)
-            seen_ids.add(p.id)
-    # Make sure every must-include post is present even if it lost on relevance.
-    for p in posts:
-        if p.id in must_include_ids and p.id not in seen_ids:
-            selected.append(p)
-            seen_ids.add(p.id)
-
+def _build_corpus(posts: list[Post], must_include_ids: set[str]) -> str:
     chunks: list[str] = []
-    for p in selected:
+    for p in posts[:MAX_POSTS_IN_CONTEXT]:
         body = (p.selftext or "").strip().replace("\n", " ")[:POST_BODY_TRIM]
         tag = f"POST_ID={p.id}" if p.id in must_include_ids else "POST"
-        header = f"{tag} [{p.score}↑ · {p.num_comments}💬] [{p.flair or '-'}] {p.title}"
-        chunk = header
-        if body:
-            chunk += f"\n  {body}"
-        for c in p.comments[:8]:
-            cbody = (c.body or "").strip().replace("\n", " ")[:COMMENT_TRIM]
-            if cbody:
-                chunk += f"\n  > [{c.score}↑] {cbody}"
+        header = f"{tag} [{p.title}]"
+        chunk = header if not body else f"{header}\n  {body}"
         chunks.append(chunk)
-
     return "\n\n".join(chunks)
 
 
 def _parse_json(text: str) -> dict:
-    # Be forgiving: strip code fences if Claude wrapped the JSON.
     text = text.strip()
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*", "", text)
@@ -115,7 +92,7 @@ def _parse_json(text: str) -> dict:
     return json.loads(text)
 
 
-def summarize(posts: list[Post], tickers: list[TickerTally]) -> Briefing:
+def summarize(posts: list[Post], tickers: list[TickerData]) -> Briefing:
     if not tickers:
         return Briefing(
             market_mood="No ticker chatter detected.",
@@ -125,28 +102,37 @@ def summarize(posts: list[Post], tickers: list[TickerTally]) -> Briefing:
         )
 
     top = tickers[:TOP_N_TICKERS]
-    top_by_score = sorted(posts, key=lambda p: p.score, reverse=True)[:TOP_N_POSTS_TO_SUMMARIZE]
-    must_include_ids = {p.id for p in top_by_score}
+    top_posts = posts[:TOP_N_POSTS_TO_SUMMARIZE]
+    must_include_ids = {p.id for p in top_posts}
 
-    corpus = _build_corpus(posts, top, must_include_ids)
-    symbol_list = ", ".join(
-        f"{t.symbol} ({t.mention_count} mentions, {t.sentiment})" for t in top
-    )
+    corpus = _build_corpus(posts, must_include_ids)
+    ticker_block = "\n".join(_format_ticker_for_prompt(t) for t in top)
 
-    user_msg = (
-        f"All {len(top)} tickers to cover in ticker_notes (in this order — first "
-        f"{TOP_N_TICKER_NOTES} get a `note`, the rest just need name + industry):\n"
-        f"{symbol_list}\n\n"
-        f"Summarize each post tagged POST_ID=... in post_summaries (use the same id).\n\n"
-        f"Raw posts and top comments (truncated):\n\n{corpus}"
-    )
+    user_msg_parts = [
+        f"Top {len(top)} tickers on r/wallstreetbets (pre-ranked by mentions, "
+        f"with rank-change vs 24h ago). Cover ALL of them in ticker_notes in "
+        f"this order — first {TOP_N_TICKER_NOTES} get a `note`, the rest need "
+        f"only industry + sentiment:\n\n"
+        f"{ticker_block}",
+    ]
+    if corpus:
+        user_msg_parts.append(
+            "Summarize each post tagged POST_ID=... in post_summaries (same id). "
+            f"Raw posts (titles + body text — no comments available):\n\n{corpus}"
+        )
+    else:
+        user_msg_parts.append(
+            "No post bodies are available today (Reddit RSS unreachable). "
+            "Return post_summaries as an empty array, but still cover all "
+            "tickers in ticker_notes."
+        )
 
     client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
     resp = client.messages.create(
         model=MODEL,
-        max_tokens=3000,
+        max_tokens=5000,
         system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": user_msg}],
+        messages=[{"role": "user", "content": "\n\n".join(user_msg_parts)}],
     )
 
     raw = resp.content[0].text

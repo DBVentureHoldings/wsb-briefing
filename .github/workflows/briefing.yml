@@ -25,10 +25,6 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Refresh ticker universe (best-effort)
-        continue-on-error: true
-        run: python update_tickers.py
-
       - name: Run briefing
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
