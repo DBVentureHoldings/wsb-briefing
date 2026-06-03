@@ -2,10 +2,12 @@ name: WSB Morning Briefing
 
 on:
   schedule:
-    # 14:00 UTC = 7am PDT (Mar–Nov) / 6am PST (Nov–Mar). Mon–Fri.
-    # GitHub Actions cron is UTC-only, so the briefing arrives 1 hour earlier
-    # during PST. You're asleep either way.
-    - cron: '0 14 * * 1-5'
+    # GitHub Actions cron drifts BADLY on top-of-hour times — round-hour
+    # schedules can fire 6+ hours late under load. We use an odd minute and
+    # schedule early to absorb drift:
+    #   11:23 UTC nominal  =  4:23am PDT  /  3:23am PST  (Mon–Fri)
+    # Even with 2–4 hours of drift, the briefing reliably lands before 8am PT.
+    - cron: '23 11 * * 1-5'
   # Lets you trigger a run manually from the Actions tab whenever you want.
   workflow_dispatch:
 
